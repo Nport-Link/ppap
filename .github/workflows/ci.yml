@@ -2,7 +2,7 @@ name: CI
 
 # **This file runs in `Nport-Link/ppap`, not here.** It is stored under `.github/workflows/ppap/`,
 # which GitHub does not execute — only the top level of `.github/workflows/` is ever read — and
-# `ppap.yml` mirrors this directory into the public repository, where it becomes
+# `trigger-ci.yml` mirrors this directory into the public repository, where it becomes
 # `.github/workflows/ci.yml` and runs on free GitHub-hosted minutes. `docs/CI.md` has the topology
 # and ADR-0057 has the reasoning.
 #
@@ -272,7 +272,7 @@ jobs:
           fetch-depth: 1
       # Resolves against `$GITHUB_WORKSPACE`, which now holds the private tree — so ppap runs the
       # composite action **at the commit under test** rather than a synced copy. That is why
-      # `ppap.yml` mirrors only `.github/workflows/ppap/` and deliberately not `.github/actions/`.
+      # `trigger-ci.yml` mirrors only `.github/workflows/ppap/` and deliberately not `.github/actions/`.
       # It must come after the checkout, or the path does not exist yet.
       - uses: ./.github/actions/install-capnp
       # `apps/desktop/src-tauri` is a workspace member, so a root `cargo clippy` builds it
