@@ -1,0 +1,362 @@
+name: CI
+
+# **This file runs in `Nport-Link/ppap`, not here.** It is stored under `.github/workflows/ppap/`,
+# which GitHub does not execute — only the top level of `.github/workflows/` is ever read — and
+# `sync-ppap.yml` mirrors this directory into the public repository, where it becomes
+# `.github/workflows/ci.yml` and runs on free GitHub-hosted minutes. `docs/CI.md` has the topology
+# and ADR-0057 has the reasoning.
+#
+# Two consequences that shape every line below, and neither is obvious from reading it in place:
+#
+# 1. **The logs are world-readable.** ppap is public. A failing clippy or vitest run prints source
+#    spans from a private tree into a public log. That is an accepted cost (ADR-0057), not an
+#    oversight — but it is why there is no `pull_request` trigger and why `permissions:` is empty.
+# 2. **The source is not here.** ppap holds workflows and nothing else, so every job checks the
+#    private repository out with a PAT before it can do anything, including resolving
+#    `uses: ./.github/actions/…`.
+
+on:
+  # `repository_dispatch` and nothing else. A fork cannot fire it — it needs write access to ppap —
+  # so the PAT and the Actions cache stay out of reach of anyone who opens a pull request against
+  # the public repository. `pull_request` here would hand both to a stranger.
+  repository_dispatch:
+    types: [nport-ci]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Commit in tuanngocptn/nport-link to test"
+        required: true
+        type: string
+      ref:
+        description: "Branch that commit is on (labelling only)"
+        required: false
+        default: manual
+        type: string
+
+# ppap's own `GITHUB_TOKEN` cannot reach the private repository — it is scoped to ppap — so every
+# cross-repo call below passes `secrets.PAT_TOKEN` explicitly. Saying `{}` here means nobody reaches
+# for the built-in token by habit and then wonders why it 404s.
+permissions: {}
+
+concurrency:
+  # Grouped by branch, not by commit: two pushes to the same branch in quick succession should
+  # cancel the older run, which is what the private `ci.yml` did with `github.ref`.
+  group: ci-${{ github.event.client_payload.ref || inputs.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  COREPACK_ENABLE_DOWNLOAD_PROMPT: 0
+  # Resolved once. `env` is available in a step's `with:`, so every checkout below reads this rather
+  # than repeating the fallback — and a commit is what CI judges, never a branch name, which moves.
+  NPORT_SHA: ${{ github.event.client_payload.sha || inputs.sha }}
+  NPORT_REPO: tuanngocptn/nport-link
+
+jobs:
+  # ── Statuses ──────────────────────────────────────────────────────────────────────
+  #
+  # The verdict has to travel back to a commit in a different repository. The Checks API cannot do
+  # it: `POST /check-runs` is restricted to GitHub App installation tokens and answers a PAT with
+  # "Only GitHub Apps may create check runs". Commit statuses can, and they are enough — a status
+  # context can be marked required in branch protection, which is the property that matters.
+  #
+  # `seed` runs first and with no `needs:`, so a run that is cancelled, or never starts because the
+  # dispatch raced a force-push, leaves a visible pending rather than leaving the commit blank.
+  # A commit with no status at all is indistinguishable from one nobody asked about.
+  seed:
+    name: Seed statuses
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mark every context pending
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          for ctx in typescript web-e2e desktop-e2e rust deny summary; do
+            gh api --method POST "/repos/${NPORT_REPO}/statuses/${NPORT_SHA}" \
+              -f state=pending \
+              -f context="ppap / ${ctx}" \
+              -f target_url="${RUN_URL}" \
+              -f description="queued in Nport-Link/ppap" >/dev/null
+          done
+          echo "Seeded 6 pending statuses on ${NPORT_SHA}."
+
+  typescript:
+    name: TypeScript
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.NPORT_REPO }}
+          ref: ${{ env.NPORT_SHA }}
+          token: ${{ secrets.PAT_TOKEN }}
+          # Otherwise the PAT stays in `.git/config` as an http.extraheader for the rest of the job,
+          # where any postinstall script in the dependency tree can read it. Nothing here pushes.
+          persist-credentials: false
+          fetch-depth: 1
+      - run: corepack enable
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm lint
+      - run: pnpm typecheck
+      - run: pnpm test
+      # The Worker-shape guard, which until now ran only in `deploy.yml` — and
+      # `deploy-staging.yml` fires on `v3-new-architect`, so on a `main` push it never ran at all. A
+      # route added to `apps/node` or `apps/registry` therefore stayed green until somebody deployed.
+      # Its own failure message says why that matters: "a reachable internal Worker lets any caller
+      # set their own x-nport-source-hash (ADR-0049)" — every per-source cap in `docs/ARCHITECTURE.md`
+      # §7 rests on that header being unforgeable. Reads the checked-in wrangler configs and nothing
+      # else, so it needs no credential and no network (defect 80).
+      - run: pnpm deploy:check
+      # DEC-6's inventory of shipped "MIT / open source" claims, checked against the tree in both
+      # directions. That table is the thing somebody works through the day relicensing is decided, so
+      # a claim missing from it outlives the decision — which had already happened once (defect 81).
+      - run: pnpm licence:check
+
+  # Its own job rather than a step in `typescript`, because it is the slowest thing in CI by an order
+  # of magnitude: it runs a full OpenNext build and boots `workerd`. Failing it should not delay the
+  # lint and typecheck feedback, and passing it should not be waited on by them.
+  web-e2e:
+    name: Web e2e
+    # **`ubuntu-24.04`, pinned — not `ubuntu-latest`.** ADR-0023 makes Linux the visual baseline
+    # platform because font rasterisation differs per OS, and the images in
+    # `apps/web/e2e/__screenshots__/linux/` were recorded on this runner image. "Linux" is not the
+    # real invariant: `--np-font` resolves to none of `-apple-system`/`SF Pro`/`Geist` there, so the
+    # pixels are whatever fontconfig substitutes, which is a property of the image and not of the OS.
+    # When `ubuntu-latest` rolls to the next LTS, an unpinned job re-rasterises every baseline and
+    # the diff looks like a site regression. Bump this deliberately, and re-record in the same change.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.NPORT_REPO }}
+          ref: ${{ env.NPORT_SHA }}
+          token: ${{ secrets.PAT_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 1
+      - run: corepack enable
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # Only chromium, and `--with-deps` for the system libraries a headless browser needs on a bare
+      # runner. Playwright pins its own browser build, which is what makes a baseline stable enough to
+      # be worth having (ADR-0023) — so this must not be replaced by a system Chrome.
+      - name: Install the pinned browser
+        run: pnpm --filter @nport/web exec playwright install --with-deps chromium
+      # `playwright.config.ts` builds through OpenNext and serves the real Worker, so there is no
+      # separate build step here. That is deliberate: this tier exists to test the artifact that
+      # deploys, and the first thing it caught was 33 pages that 404 only from the Worker.
+      - run: pnpm test:e2e
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-report
+          path: apps/web/playwright-report/
+          retention-days: 7
+
+      # ── Recording the visual baselines ────────────────────────────────────────────────
+      #
+      # **On this runner, or not at all.** ADR-0023 pins baselines to Linux because font rasterisation
+      # differs per OS, and the job above is where they are compared — so they have to be produced by
+      # the same image and the same architecture. A baseline recorded in a Playwright container on an
+      # arm64 laptop fails every run here, which is the churn the original objection to screenshot tests
+      # was about.
+      #
+      # **The marker is read from git, not from the event.** The private `ci.yml` used
+      # `contains(github.event.head_commit.message, …)`, and that field does not exist under
+      # `repository_dispatch` — the step would silently never fire. Forwarding the message through
+      # `client_payload` would fix the symptom and open a hole: a commit message is attacker-shaped
+      # text, and interpolating it into an `if:` or a `run:` is a script-injection primitive. Reading
+      # it from the checkout is both injection-proof and always the message actually under test.
+      #
+      # It uploads rather than commits. A workflow that pushes screenshots into the tree would be a
+      # workflow that can rewrite what it is being judged against; a human downloads the artifact, looks
+      # at the images, and commits them. `docs/TESTING.md` § Frontend e2e has the review rule.
+      #
+      # **`always()` is load-bearing.** Without it these steps only run when the job is green — which
+      # is to say, only when the baselines already match and there is nothing to record. The one
+      # time it worked was the first, when no baseline existed and the spec skipped. The moment a
+      # baseline legitimately changed, the compare failed, this was skipped, and re-recording became
+      # impossible (`docs/ROADMAP.md`, defect 51).
+      - name: Is this a baseline-recording commit?
+        id: marker
+        if: always()
+        run: |
+          set -euo pipefail
+          if git log -1 --pretty=%B | grep -qF '[record-baselines]'; then
+            echo "record=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "record=no" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Record the visual baselines
+        if: always() && steps.marker.outputs.record == 'yes'
+        env:
+          NPORT_VISUAL: "1"
+        run: pnpm --filter @nport/web exec playwright test visual.spec.ts --update-snapshots
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.marker.outputs.record == 'yes'
+        with:
+          name: visual-baselines-linux
+          path: apps/web/e2e/__screenshots__/
+          retention-days: 7
+          if-no-files-found: error
+
+  # `apps/desktop`'s frontend had **zero** CI coverage before this job: `pnpm test` in the
+  # `typescript` job above only runs its Vitest tier (`src/lib`, pure logic, no DOM), and the two
+  # Chromium harnesses under `scripts/` — the virtualized inspector list and the filled-accent
+  # accent, coffee-card and type tokens — only ever ran on whoever's laptop happened to invoke them by hand.
+  # Defect 66 (a theme-inverted button ink) shipped and sat uncaught for exactly that reason: nothing
+  # gated a merge on it. Neither script is the owed browser tier (that needs `tauri-driver` and is
+  # still Phase 4, `docs/TESTING.md` § Frontend e2e) — both drive the WebView content in Chromium with
+  # Tauri's IPC stubbed, which proves layout and computed CSS, not WKWebView/WebView2/WebKitGTK.
+  desktop-e2e:
+    name: Desktop e2e
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.NPORT_REPO }}
+          ref: ${{ env.NPORT_SHA }}
+          token: ${{ secrets.PAT_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 1
+      - run: corepack enable
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Install the pinned browser
+        run: pnpm --filter @nport/desktop exec playwright install --with-deps chromium
+      - run: pnpm --filter @nport/desktop check:inspector
+      - run: pnpm --filter @nport/desktop check:tokens
+
+  rust:
+    name: Rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # All three, every time. The private `ci.yml` ran Linux-only on pull requests because macOS
+        # bills at 10× and Windows at 2× — on a public repository both are free, so the reason for
+        # the conditional matrix is gone and the coverage comes back. This is the single largest
+        # thing the move buys (ADR-0057).
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.NPORT_REPO }}
+          ref: ${{ env.NPORT_SHA }}
+          token: ${{ secrets.PAT_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 1
+      # Resolves against `$GITHUB_WORKSPACE`, which now holds the private tree — so ppap runs the
+      # composite action **at the commit under test** rather than a synced copy. That is why
+      # `sync-ppap.yml` mirrors only `.github/workflows/ppap/` and deliberately not `.github/actions/`.
+      # It must come after the checkout, or the path does not exist yet.
+      - uses: ./.github/actions/install-capnp
+      # `apps/desktop/src-tauri` is a workspace member, so a root `cargo clippy` builds it
+      # on every platform. macOS and Windows have their WebView in the OS; Linux does not,
+      # and the failure is a `pkg-config` error from `gobject-sys` several hundred lines
+      # into an otherwise normal build. WebKitGTK is the only Linux WebView there is.
+      - name: Install the Linux WebView and GTK development headers
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            libssl-dev
+      # rust-toolchain.toml pins the exact version, and rustup honours it.
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      # `--all-targets`, matching clippy above. Without it, `cargo test` skips tests that live
+      # inside examples — and `crates/protocol/examples/support/proxy.rs` holds the 11 chunked
+      # transfer-coding tests written for a bug that reached a browser as a page of binary
+      # garbage. Verified: plain `cargo test --all-features` runs none of them.
+      - run: cargo test --all-targets --all-features
+      # `--all-targets` skips doctests, so they need their own run. Nothing has one yet; the step
+      # exists so the first one added is not silently unrun.
+      - run: cargo test --doc --all-features
+      - name: Documentation consistency
+        if: runner.os == 'Linux'
+        run: cargo xtask verify-docs
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.NPORT_REPO }}
+          ref: ${{ env.NPORT_SHA }}
+          token: ${{ secrets.PAT_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 1
+      # A Docker action, and panda has no Docker daemon — one of the reasons this job could not
+      # simply have moved to the self-hosted runner instead (`docs/CI.md` § What runs where).
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check all
+
+  # ── The verdict ───────────────────────────────────────────────────────────────────
+  #
+  # `if: always()` is what makes this correct rather than approximately correct: without it, a run
+  # where anything failed would skip this job and leave five statuses stuck on pending forever,
+  # which reads as "still running" rather than "failed" and is worse than no status at all.
+  report:
+    name: Report
+    needs: [seed, typescript, web-e2e, desktop-e2e, rust, deny]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post the result of every job onto the private commit
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          # `needs` as JSON, so the mapping below is over whatever jobs exist rather than over a
+          # hand-kept list that a new job would silently fall off.
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+
+          post() {
+            gh api --method POST "/repos/${NPORT_REPO}/statuses/${NPORT_SHA}" \
+              -f state="$2" -f context="ppap / $1" \
+              -f target_url="${RUN_URL}" -f description="$3" >/dev/null
+          }
+
+          # `skipped` maps to success on purpose: a job skipped by a conditional has not failed, and
+          # a required status that never resolves blocks a merge for no reason. `cancelled` maps to
+          # `error` rather than `failure` — it is not a verdict about the code, and the distinction
+          # is visible in the UI.
+          jq -r 'to_entries[] | select(.key != "seed") | "\(.key)\t\(.value.result)"' <<<"$RESULTS" |
+          while IFS=$'\t' read -r job result; do
+            case "$result" in
+              success)   post "$job" success "passed" ;;
+              skipped)   post "$job" success "skipped" ;;
+              cancelled) post "$job" error   "cancelled" ;;
+              *)         post "$job" failure "failed — see the ppap run" ;;
+            esac
+          done
+
+          # One aggregate context, and the only one worth marking required in branch protection:
+          # six required contexts is six things to rename by hand the day a job is renamed.
+          if jq -e 'to_entries | map(select(.key != "seed"))
+                    | all(.value.result == "success" or .value.result == "skipped")' \
+               <<<"$RESULTS" >/dev/null; then
+            post summary success "every job passed"
+          else
+            post summary failure "at least one job failed — see the ppap run"
+          fi
