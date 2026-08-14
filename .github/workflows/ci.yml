@@ -21,6 +21,12 @@ on:
   # the public repository. `pull_request` here would hand both to a stranger.
   repository_dispatch:
     types: [nport-ci]
+  # Nightly, inherited from the smoke workflow this absorbed. An edge change breaks installed clients
+  # and the point is to hear it from a cron job rather than from an issue; 03:20 is off the hour
+  # because every scheduled workflow on GitHub fires at :00. On this trigger the `smoke` job below is
+  # the one that matters, and everything else runs too because it is free.
+  schedule:
+    - cron: "20 3 * * *"
   workflow_dispatch:
     inputs:
       sha:
@@ -41,7 +47,7 @@ permissions: {}
 concurrency:
   # Grouped by branch, not by commit: two pushes to the same branch in quick succession should
   # cancel the older run, which is what the private `ci.yml` did with `github.ref`.
-  group: ci-${{ github.event.client_payload.ref || inputs.ref }}
+  group: ci-${{ github.event.client_payload.ref || inputs.ref || 'nightly' }}
   cancel-in-progress: true
 
 env:
@@ -49,7 +55,12 @@ env:
   COREPACK_ENABLE_DOWNLOAD_PROMPT: 0
   # Resolved once. `env` is available in a step's `with:`, so every checkout below reads this rather
   # than repeating the fallback — and a commit is what CI judges, never a branch name, which moves.
-  NPORT_SHA: ${{ github.event.client_payload.sha || inputs.sha }}
+  #
+  # **`main` is the third fallback and it is not decoration.** A `schedule` run carries neither a
+  # `client_payload` nor `inputs`, so without it this resolves to the empty string: every checkout
+  # would ask for ref `""` and every status post would target a commit called nothing. The nightly is
+  # the one trigger with no commit under test, which is also why `seed` and `report` sit it out.
+  NPORT_SHA: ${{ github.event.client_payload.sha || inputs.sha || 'main' }}
   NPORT_REPO: tuanngocptn/nport-link
 
 jobs:
@@ -65,6 +76,9 @@ jobs:
   # A commit with no status at all is indistinguishable from one nobody asked about.
   seed:
     name: Seed statuses
+    # Nothing to seed on the nightly: it tests `main` as it stands, not a commit somebody pushed, so
+    # there is no place to hang a status that a human would ever look at.
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - name: Mark every context pending
@@ -73,14 +87,14 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
-          for ctx in typescript web-e2e desktop-e2e rust deny summary; do
+          for ctx in typescript web-e2e desktop-e2e rust deny drift summary; do
             gh api --method POST "/repos/${NPORT_REPO}/statuses/${NPORT_SHA}" \
               -f state=pending \
               -f context="ppap / ${ctx}" \
               -f target_url="${RUN_URL}" \
               -f description="queued in Nport-Link/ppap" >/dev/null
           done
-          echo "Seeded 6 pending statuses on ${NPORT_SHA}."
+          echo "Seeded 7 pending statuses on ${NPORT_SHA}."
 
   typescript:
     name: TypeScript
@@ -310,6 +324,154 @@ jobs:
         with:
           command: check all
 
+  # ── Generated files still match their sources ─────────────────────────────────────
+  #
+  # **The single mechanism keeping three languages honest**: regenerate everything, then fail if the
+  # tree changed. `packages/contract` is the authority (invariant 7) and is generated outward into
+  # TypeScript, Rust, two OpenAPI documents and the error registry; without this, a hand-edited
+  # generated file or a forgotten `pnpm codegen` desynchronises them silently and nothing notices
+  # until a client and a server disagree at runtime (ADR-0009, invariant 6).
+  #
+  # **A job here rather than its own workflow.** It was `codegen-drift.yml`, and it shared this file's
+  # trigger, its runner and its checkout — the only thing it did not share was a concurrency group,
+  # which is not worth a second entry in ppap's Actions list.
+  #
+  # Its `git --no-pager diff` prints into a public log on failure. That is the sharpest edge of
+  # ADR-0057 and it is deliberate: the diff is the whole diagnostic value, and `--stat` would leave it
+  # saying only that *something* drifted.
+  drift:
+    name: Codegen drift
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.NPORT_REPO }}
+          ref: ${{ env.NPORT_SHA }}
+          token: ${{ secrets.PAT_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 1
+      - run: corepack enable
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # `cargo xtask codegen` builds `nport` now (it reads `Args`'s clap definition to generate
+      # `schema/cli.json`), which pulls in `nport-protocol`, whose `build.rs` shells out to `capnp`.
+      # Before that dependency this job needed no system toolchain at all — the commit that added it
+      # claimed "the drift workflow already pays for" a Rust build, and this is that claim being wrong.
+      - uses: ./.github/actions/install-capnp
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+
+      # The tree must be clean *before* codegen runs, or a leftover file reads as drift and sends
+      # somebody looking for a generator bug that is not there. Free on a hosted runner, which starts
+      # clean; the reason it is here at all is that the same assertion is load-bearing on panda,
+      # where the workspace is reused between jobs (`docs/CI.md` § Self-hosted notes).
+      - name: The tree must start clean
+        run: |
+          set -euo pipefail
+          dirty=$(git status --porcelain)
+          if [ -n "$dirty" ]; then
+            echo "::error::The workspace was dirty before codegen ran. This is runner hygiene, not drift."
+            echo "$dirty"
+            exit 1
+          fi
+
+      - run: pnpm codegen
+      - run: cargo xtask codegen
+
+      - name: Fail if generated files are out of date
+        run: |
+          changed=$(git status --porcelain)
+          if [ -n "$changed" ]; then
+            echo "::error::Generated files are out of date. Run 'pnpm codegen && cargo xtask codegen' and commit the result."
+            echo "$changed"
+            git --no-pager diff
+            exit 1
+          fi
+          echo "Tree is clean."
+
+
+  # ── A tunnel, on three operating systems ──────────────────────────────────────────
+  #
+  # **The only test in here that opens a port on the internet.** Every other job stops at a fake:
+  # `pnpm test` drives `apps/node` in real `workerd` against `test/fake-cloudflare.ts`, and
+  # `pnpm smoke` drives the CLI against `wrangler dev` with a credential the edge refuses on purpose.
+  # This one provisions a real lease on the deployed control plane, dials Cloudflare's edge over QUIC,
+  # and serves real requests from a local origin. It is the mechanism behind Gate G2's cross-platform
+  # criterion (`docs/ROADMAP.md`), which is why the matrix is the point of it rather than a detail:
+  # the failure it exists to catch only appears on an OS nobody develops on.
+  #
+  # **A job in CI rather than its own workflow**, which is where it had been. It ran nightly on a
+  # `schedule:` of its own; the schedule moved up to this workflow, so a nightly run now exercises
+  # everything at once and there is one fewer entry in ppap's Actions list.
+  #
+  # **Nightly only, and that is the whole reason for the `if:`.** It costs one real tunnel per OS
+  # against the environment's per-source hourly cap. Running it on every dispatch would mean three
+  # creates per push — roughly a hundred pushes a day — which would exhaust that cap and start
+  # failing for a reason unrelated to any commit. The per-deploy proof is a separate Linux-only job
+  # in `deploy.yml`; this is the cross-platform one.
+  smoke:
+    name: Smoke (${{ matrix.os }})
+    if: github.event_name == 'schedule'
+    runs-on: ${{ matrix.os }}
+    # One OS failing must not cancel the others. Which platforms fail is the diagnosis — "Windows
+    # only" and "everywhere" are different bugs, and fail-fast throws that away.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      # `main`, not a commit. A scheduled run has no commit under test — it is asking whether the
+      # deployed control plane still works for whatever is current, which is a different question
+      # from the one every other job here answers.
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.NPORT_REPO }}
+          ref: main
+          token: ${{ secrets.PAT_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+
+      - uses: ./.github/actions/install-capnp
+
+      # rust-toolchain.toml pins the exact version and rustup honours it, so nothing here names a
+      # version. A second place naming one is a second place to forget to bump.
+      - run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: smoke-${{ matrix.os }}
+
+      # Release, not debug. The debug binary is ~39 MB and slower to start, and the thing being
+      # proved is the artifact users get.
+      - name: Build the CLI
+        run: cargo build --release -p nport
+
+      - name: A real tunnel carries real traffic
+        shell: bash
+        env:
+          RUNNER_OS_NAME: ${{ matrix.os }}
+        run: |
+          # An `if`, not `[ … ] && assign`: Actions runs bash with `-e`, so a false test as the last
+          # command of a line exits 1 — and this test is false on two of the three platforms.
+          if [ "$RUNNER_OS_NAME" = "windows-latest" ]; then
+            binary=target/release/nport.exe
+          else
+            binary=target/release/nport
+          fi
+          # `--expiry` abandons a tunnel with SIGKILL and waits for the server's own alarm to delete
+          # the DNS record — about two and a half minutes on top of the run, and one extra create.
+          # Affordable nightly; it is why the per-deploy job does not do it.
+          node scripts/smoke-live.mjs \
+            --backend https://api.nport.online \
+            --binary "$binary" --expiry
+
   # ── The verdict ───────────────────────────────────────────────────────────────────
   #
   # `if: always()` is what makes this correct rather than approximately correct: without it, a run
@@ -317,8 +479,8 @@ jobs:
   # which reads as "still running" rather than "failed" and is worse than no status at all.
   report:
     name: Report
-    needs: [seed, typescript, web-e2e, desktop-e2e, rust, deny]
-    if: always()
+    needs: [seed, typescript, web-e2e, desktop-e2e, rust, deny, drift, smoke]
+    if: always() && github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - name: Post the result of every job onto the private commit
