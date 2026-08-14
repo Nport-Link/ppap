@@ -1,0 +1,131 @@
+name: Nightly tunnel
+
+# **The only test anywhere that opens a port on the internet.**
+#
+# Everything in `ci.yml` stops at a fake: `pnpm test` drives `apps/node` in real `workerd` against
+# `test/fake-cloudflare.ts`, and `pnpm smoke` drives the CLI against `wrangler dev` with a credential
+# the edge refuses on purpose. This one provisions a real lease on the deployed control plane, dials
+# Cloudflare's edge over QUIC, and serves real requests from a local origin.
+#
+# It is the mechanism behind Gate G2's cross-platform criterion (`docs/ROADMAP.md`), which is why the
+# matrix is the point of the file rather than a detail of it: the failure it exists to catch only
+# appears on an OS nobody develops on.
+#
+# ## Why it is not a job in `ci.yml`
+#
+# It was, briefly, and the shape was wrong. CI answers *is this commit good*; this answers *does the
+# edge still work*, on a clock, for a tree nobody just pushed. Folding the second into the first made
+# `ci.yml` carry a `schedule:` trigger it otherwise had no use for, and forced `if:` guards onto the
+# status jobs so a cron run would not try to post a verdict about a commit that did not exist. The
+# job was also skipped on every dispatch — which is nearly all of them — so the one place it appeared
+# in a checks list was as a permanent grey row.
+#
+# ## The other tunnel test, and why both
+#
+# `deploy.yml`'s **`Prove a tunnel`** runs straight after a staging deploy, on Linux, and asks whether
+# the thing just deployed carries traffic — the last link in gate → terraform → deploy → verify. This
+# one asks whether the edge still works for **installed clients**, on the two platforms no
+# self-hosted runner covers, and pays for `--expiry`: SIGKILL a tunnel and wait for the server's own
+# alarm to delete the DNS record, two and a half minutes and one extra create for a property that
+# does not change between commits.
+#
+# They overlap by one Linux create a night, kept on purpose so a single run answers for all three
+# platforms rather than sending somebody to another workflow for a third of the answer.
+#
+# **Nightly, not per push.** One real tunnel per OS against the environment's per-source hourly cap;
+# three creates on every push, at roughly a hundred pushes a day, would exhaust that cap and start
+# failing for reasons unrelated to any commit.
+
+on:
+  # 03:20 UTC is off the hour on purpose: every scheduled workflow on GitHub fires at :00, and the
+  # queue at that minute is worth avoiding. An edge change breaks installed clients, and the point is
+  # to hear it from a cron job rather than from an issue.
+  schedule:
+    - cron: "20 3 * * *"
+  workflow_dispatch:
+    inputs:
+      backend:
+        description: "Control plane to test against"
+        required: false
+        default: https://api.nport.online
+        type: string
+      ref:
+        description: "Ref of tuanngocptn/nport-link to build the CLI from"
+        required: false
+        default: main
+        type: string
+
+permissions: {}
+
+concurrency:
+  # Never two matrices at once: they share the environment's tunnel cap and its per-source quota, and
+  # a nightly overlapping a dispatch would fail for a reason that has nothing to do with the code.
+  group: nightly-tunnel-${{ inputs.backend || 'https://api.nport.online' }}
+  cancel-in-progress: false
+
+env:
+  NPORT_REPO: tuanngocptn/nport-link
+  # A ref, not a commit. This is the one test with no commit under test: it asks whether the deployed
+  # control plane still works for whatever is current.
+  NPORT_SHA: ${{ inputs.ref || 'main' }}
+
+jobs:
+  tunnel:
+    # No `name:` override. With one, a matrix job that never expands renders the literal
+    # `${{ matrix.os }}` in a checks list; the job id gives `tunnel (ubuntu-latest)` for free.
+    runs-on: ${{ matrix.os }}
+    # One OS failing must not cancel the others. Which platforms fail is the diagnosis — "Windows
+    # only" and "everywhere" are different bugs, and fail-fast throws that away.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      # A ref, not a commit — see `NPORT_SHA` above. The dispatch input exists so a bad night can be
+      # re-run against the exact tree that failed rather than against whatever `main` has become.
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.NPORT_REPO }}
+          ref: ${{ env.NPORT_SHA }}
+          token: ${{ secrets.PAT_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+
+      - uses: ./.github/actions/install-capnp
+
+      # rust-toolchain.toml pins the exact version and rustup honours it, so nothing here names a
+      # version. A second place naming one is a second place to forget to bump.
+      - run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: nightly-tunnel-${{ matrix.os }}
+
+      # Release, not debug. The debug binary is ~39 MB and slower to start, and the thing being
+      # proved is the artifact users get.
+      - name: Build the CLI
+        run: cargo build --release -p nport
+
+      - name: A real tunnel carries real traffic
+        shell: bash
+        env:
+          RUNNER_OS_NAME: ${{ matrix.os }}
+          BACKEND: ${{ inputs.backend || 'https://api.nport.online' }}
+        run: |
+          # An `if`, not `[ … ] && assign`: Actions runs bash with `-e`, so a false test as the last
+          # command of a line exits 1 — and this test is false on two of the three platforms.
+          if [ "$RUNNER_OS_NAME" = "windows-latest" ]; then
+            binary=target/release/nport.exe
+          else
+            binary=target/release/nport
+          fi
+          # `--expiry` abandons a tunnel with SIGKILL and waits for the server's own alarm to delete
+          # the DNS record — about two and a half minutes on top of the run, and one extra create.
+          # Affordable nightly; it is why the per-deploy job does not do it.
+          node scripts/smoke-live.mjs \
+            --backend "$BACKEND" \
+            --binary "$binary" --expiry
