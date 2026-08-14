@@ -73,6 +73,14 @@ on:
         required: false
         default: NportLink
         type: string
+      sha:
+        description: >-
+          The commit or tag to deploy. **This is what promotion means**: production passes a `v3.x.y`
+          that already ran on staging, so what ships is the artifact that was proved rather than a
+          rebuild of it. Defaults to `main` only so a caller that genuinely wants the tip can omit it.
+        required: false
+        default: main
+        type: string
 
 # One deploy at a time, and never cancel one half-way: an interrupted `wrangler deploy` can leave a
 # Worker live on new code with a Durable Object migration half-applied, and migrations are

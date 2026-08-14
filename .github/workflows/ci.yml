@@ -116,6 +116,10 @@ jobs:
       # directions. That table is the thing somebody works through the day relicensing is decided, so
       # a claim missing from it outlives the decision — which had already happened once (defect 81).
       - run: pnpm licence:check
+      # The release version arithmetic. `scripts/` sits outside the pnpm workspace and so outside
+      # `turbo run test`, which means a `*.test.mjs` beside it would run nowhere — the selftest is
+      # how that table gets exercised, and it belongs here beside the other two assertions.
+      - run: node scripts/next-version.mjs --selftest
 
   # Its own job rather than a step in `typescript`, because it is the slowest thing in CI by an order
   # of magnitude: it runs a full OpenNext build and boots `workerd`. Failing it should not delay the
