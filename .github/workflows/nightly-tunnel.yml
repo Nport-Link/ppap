@@ -50,7 +50,7 @@ on:
         default: https://api.nport.online
         type: string
       ref:
-        description: "Ref of tuanngocptn/nport-link to build the CLI from"
+        description: "Ref of Nport-Link/nport to build the CLI from"
         required: false
         default: main
         type: string
@@ -64,7 +64,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  NPORT_REPO: tuanngocptn/nport-link
+  NPORT_REPO: Nport-Link/nport
   # A ref, not a commit. This is the one test with no commit under test: it asks whether the deployed
   # control plane still works for whatever is current.
   NPORT_SHA: ${{ inputs.ref || 'main' }}

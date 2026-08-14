@@ -24,7 +24,7 @@ on:
   workflow_dispatch:
     inputs:
       sha:
-        description: "Commit in tuanngocptn/nport-link to test"
+        description: "Commit in Nport-Link/nport to test"
         required: true
         type: string
       ref:
@@ -50,7 +50,7 @@ env:
   # Resolved once. `env` is available in a step's `with:`, so every checkout below reads this rather
   # than repeating the fallback — and a commit is what CI judges, never a branch name, which moves.
   NPORT_SHA: ${{ github.event.client_payload.sha || inputs.sha }}
-  NPORT_REPO: tuanngocptn/nport-link
+  NPORT_REPO: Nport-Link/nport
 
 jobs:
   # ── Statuses ──────────────────────────────────────────────────────────────────────

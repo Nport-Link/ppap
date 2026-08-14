@@ -28,24 +28,27 @@ name: Deploy staging
 #      commit that moved the file — moving it again breaks `pnpm deploy:check` at read time rather
 #      than at assert time, which reads as a missing file rather than a failed check.
 #
-# ## Staging deploys on a push to `main`
+# ## What triggers it
 #
-# `main` is the only branch — `v3-new-architect` was retired into it — and a push there used to
-# deploy nothing. It now deploys staging, by way of `trigger-ci.yml` in the private repository sending a
-# `nport-deploy` dispatch. Production, when G2 closes, is a `deploy-production.yml` beside this one
-# that calls it with its own three values; every input defaults to staging's, which is what lets the
-# dispatch pass nothing. `docs/DEPLOYMENT.md` § Adding production has it written out.
+# The `Release` workflow in the private repository, and nothing else (ADR-0060). It computes a
+# version, tags it, and dispatches `nport-deploy` for **that tag** — so what deploys is a named thing
+# that can be deployed again, rather than whatever `main` happened to be. A push to `main` deploys
+# nothing; it did for one day, which is what ADR-0060 undid.
+#
+# Production, when G2 closes, is a `deploy-production.yml` beside this one that calls it with its own
+# values and a `sha` naming a `v3.x.y` tag that already ran on staging. Every input defaults to
+# staging's. `docs/DEPLOYMENT.md` § Adding production has it written out.
 
 on:
-  # Sent by `trigger-ci.yml` in `tuanngocptn/nport-link` on a push to `main`. A separate event type from
-  # `nport-ci` so that a deploy and a test run are independently triggerable — CI runs on every push
-  # and every pull request, and a deploy must not.
+  # Sent by `release.yml` in `Nport-Link/nport`, carrying the tag it just cut. A separate event type
+  # from `nport-ci` so the two are independently triggerable — CI runs on every push and every pull
+  # request, and a deploy must run only when somebody names a version.
   repository_dispatch:
     types: [nport-deploy]
   workflow_dispatch:
     inputs:
       sha:
-        description: "Commit in tuanngocptn/nport-link to deploy"
+        description: "Commit in Nport-Link/nport to deploy"
         required: false
         default: main
         type: string
@@ -105,7 +108,7 @@ env:
   # The tree being deployed. `client_payload.sha` on a dispatch from `trigger-ci.yml`, the dispatch input
   # by hand, and `main` for a `workflow_call` from a future production caller — which passes inputs
   # for the environment but has no commit of its own to name.
-  NPORT_REPO: tuanngocptn/nport-link
+  NPORT_REPO: Nport-Link/nport
   NPORT_SHA: ${{ github.event.client_payload.sha || inputs.sha || 'main' }}
 
 jobs:
