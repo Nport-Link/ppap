@@ -2,7 +2,7 @@ name: CI
 
 # **This file runs in `Nport-Link/ppap`, not here.** It is stored under `.github/workflows/ppap/`,
 # which GitHub does not execute — only the top level of `.github/workflows/` is ever read — and
-# `sync-ppap.yml` mirrors this directory into the public repository, where it becomes
+# `ppap.yml` mirrors this directory into the public repository, where it becomes
 # `.github/workflows/ci.yml` and runs on free GitHub-hosted minutes. `docs/CI.md` has the topology
 # and ADR-0057 has the reasoning.
 #
@@ -104,9 +104,9 @@ jobs:
       - run: pnpm lint
       - run: pnpm typecheck
       - run: pnpm test
-      # The Worker-shape guard, which until now ran only in `deploy.yml` — and
-      # `deploy-staging.yml` fires on `v3-new-architect`, so on a `main` push it never ran at all. A
-      # route added to `apps/node` or `apps/registry` therefore stayed green until somebody deployed.
+      # The Worker-shape guard, which for a long time ran only in `deploy.yml`, on a branch that a
+      # `main` push never touched — so a route added to `apps/node` or `apps/registry` stayed green
+      # until somebody deployed.
       # Its own failure message says why that matters: "a reachable internal Worker lets any caller
       # set their own x-nport-source-hash (ADR-0049)" — every per-source cap in `docs/ARCHITECTURE.md`
       # §7 rests on that header being unforgeable. Reads the checked-in wrangler configs and nothing
@@ -258,7 +258,7 @@ jobs:
           fetch-depth: 1
       # Resolves against `$GITHUB_WORKSPACE`, which now holds the private tree — so ppap runs the
       # composite action **at the commit under test** rather than a synced copy. That is why
-      # `sync-ppap.yml` mirrors only `.github/workflows/ppap/` and deliberately not `.github/actions/`.
+      # `ppap.yml` mirrors only `.github/workflows/ppap/` and deliberately not `.github/actions/`.
       # It must come after the checkout, or the path does not exist yet.
       - uses: ./.github/actions/install-capnp
       # `apps/desktop/src-tauri` is a workspace member, so a root `cargo clippy` builds it

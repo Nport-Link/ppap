@@ -1,0 +1,640 @@
+name: Deploy staging
+
+# **One deploy definition for every environment.** Staging and production run the same
+# infrastructure in separate Cloudflare accounts (ADR-0038) and the same Workers from the same
+# `wrangler.jsonc`; what differs is the account, the zone, and which secrets the GitHub Environment
+# holds. A second copy of this file would drift the first time somebody fixed a step in one and not
+# the other — and the drift would surface as a production deploy behaving unlike every staging
+# deploy that had been proving it safe.
+#
+# ## This runs in `Nport-Link/ppap`, and it carries real credentials
+#
+# **The public repository holds this pipeline's secrets** — `CLOUDFLARE_API_TOKEN`,
+# `CLOUDFLARE_ACCOUNT_ID`, `WORKER_CF_API_TOKEN` and `TF_API_TOKEN` — and its `staging` Environment.
+# ADR-0057 originally kept it private for exactly that reason; ADR-0058 records the owner's decision
+# to move it anyway, and the consequence in plain terms: **anyone who can land a file in ppap can
+# read them**, and that set is full control of the Cloudflare account plus the Terraform state.
+#
+# It saves nothing. The deploys ran unmetered on the self-hosted runners already. What it buys is a
+# private repository whose Actions tab holds one workflow, and that was the owner's call to make.
+#
+# Two things follow that are not optional:
+#
+#   1. **ppap must never gain a `pull_request` trigger, and outside collaborators must stay behind
+#      approval.** Those are what keep a fork from reaching these secrets. Elsewhere in this
+#      directory that rule protects a read-only token; here it protects the account.
+#   2. **`scripts/deploy-check.mjs` reads this file by path** to prove the Worker secrets a
+#      `wrangler.jsonc` requires are actually supplied. It was updated to this path in the same
+#      commit that moved the file — moving it again breaks `pnpm deploy:check` at read time rather
+#      than at assert time, which reads as a missing file rather than a failed check.
+#
+# ## Staging deploys on a push to `main`
+#
+# `main` is the only branch — `v3-new-architect` was retired into it — and a push there used to
+# deploy nothing. It now deploys staging, by way of `ppap.yml` in the private repository sending a
+# `nport-deploy` dispatch. Production, when G2 closes, is a `deploy-production.yml` beside this one
+# that calls it with its own three values; every input defaults to staging's, which is what lets the
+# dispatch pass nothing. `docs/DEPLOYMENT.md` § Adding production has it written out.
+
+on:
+  # Sent by `ppap.yml` in `tuanngocptn/nport-link` on a push to `main`. A separate event type from
+  # `nport-ci` so that a deploy and a test run are independently triggerable — CI runs on every push
+  # and every pull request, and a deploy must not.
+  repository_dispatch:
+    types: [nport-deploy]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Commit in tuanngocptn/nport-link to deploy"
+        required: false
+        default: main
+        type: string
+  # The same file, called by `deploy-production.yml` when G2 closes.
+  workflow_call:
+    inputs:
+      environment:
+        description: >-
+          The GitHub Environment, which is also the wrangler `--env` name and the Terraform state
+          prefix. One name, three uses, so they cannot disagree.
+        required: false
+        default: staging
+        type: string
+      zone:
+        description: "Apex domain for this environment, e.g. nport.online."
+        required: false
+        default: nport.online
+        type: string
+      tf_organization:
+        description: >-
+          HCP Terraform organization holding the workspaces. Passed rather than stored: it is not a
+          secret — it is in the workspace URL — and a GitHub *variable* that must be a variable and
+          not a secret, on the Environment and not the repository, is three ways to get wrong
+          something that has one correct value.
+        required: false
+        default: NportLink
+        type: string
+
+# One deploy at a time, and never cancel one half-way: an interrupted `wrangler deploy` can leave a
+# Worker live on new code with a Durable Object migration half-applied, and migrations are
+# forward-only (`docs/RELEASE.md`). Queueing is the slow, correct behaviour — and it is bounded
+# rather than unbounded, because GitHub keeps at most one *pending* run per group and cancels the
+# older one, so a burst of pushes leaves one deploy running and one waiting rather than a backlog.
+concurrency:
+  group: deploy-${{ inputs.environment || 'staging' }}
+  cancel-in-progress: false
+
+# ppap's own `GITHUB_TOKEN` cannot reach the private repository — it is scoped to ppap — so every
+# checkout below passes `secrets.PAT_TOKEN` explicitly.
+permissions: {}
+
+env:
+  COREPACK_ENABLE_DOWNLOAD_PROMPT: 0
+  # Derived rather than passed, so the workflow cannot disagree with itself about where to look.
+  # `api` matches `api_subdomain`'s default in infra/terraform/variables.tf; change one and the
+  # verify job fails, which is the intended way to find out.
+  API_HOST: api.${{ inputs.zone || 'nport.online' }}
+  SITE_HOST: ${{ inputs.zone || 'nport.online' }}
+  # The tree being deployed. `client_payload.sha` on a dispatch from `ppap.yml`, the dispatch input
+  # by hand, and `main` for a `workflow_call` from a future production caller — which passes inputs
+  # for the environment but has no commit of its own to name.
+  NPORT_REPO: tuanngocptn/nport-link
+  NPORT_SHA: ${{ github.event.client_payload.sha || inputs.sha || 'main' }}
+
+jobs:
+  # ── Everything that can fail without an account ────────────────────────────────────────
+  #
+  # Deliberately first and deliberately complete. A deploy that fails after `wrangler deploy` has
+  # already run has changed the world; a deploy that fails here has not.
+  gate:
+    name: Gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.NPORT_REPO }}
+          ref: ${{ env.NPORT_SHA }}
+          token: ${{ secrets.PAT_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 1
+      - run: corepack enable
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm lint
+      - run: pnpm typecheck
+      - run: pnpm test
+
+      # Wrangler's `vars` are `notInheritable`, so an environment block missing a key deploys
+      # happily and answers with numbers nobody configured. Nothing in `wrangler deploy` warns.
+      - name: Environment shape
+        run: pnpm deploy:check
+
+      # Resolves each real config against the real schema without contacting Cloudflare. **All three
+      # backend Workers**, because a deploy now touches three and a config error in the second or third
+      # would be found after the first has already changed the world.
+      - name: Dry-run the backend Workers
+        run: |
+          for app in api registry gateway; do
+            pnpm --filter @nport/$app exec wrangler deploy --dry-run --env ${{ inputs.environment || 'staging' }}
+          done
+
+  # ── Infrastructure ─────────────────────────────────────────────────────────────────────
+  terraform:
+    name: Terraform
+    needs: gate
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment || 'staging' }}
+    defaults:
+      run:
+        working-directory: infra/terraform
+    # **Declared on the job, not on the workflow.** An Environment's variables only resolve inside a
+    # job that declares `environment:`; at workflow level that context does not exist yet and
+    # `vars.TF_CLOUD_ORGANIZATION` silently evaluates to empty. Terraform then reports the
+    # organization as unset, which reads like a missing GitHub setting rather than a scoping mistake.
+    #
+    # `versions.tf` names neither the organization nor the workspace, so one configuration serves
+    # every environment; these two are what select the state HCP hands back.
+    env:
+      TF_CLOUD_ORGANIZATION: ${{ inputs.tf_organization || 'NportLink' }}
+      TF_WORKSPACE: nport-${{ inputs.environment || 'staging' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.NPORT_REPO }}
+          ref: ${{ env.NPORT_SHA }}
+          token: ${{ secrets.PAT_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: 1.14.9
+          terraform_wrapper: false
+          # Writes ~/.terraformrc so `terraform init` can reach app.terraform.io. This is the only
+          # credential the state backend needs — there is no bucket and no derived key pair.
+          cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+
+      # **A Workers account prerequisite, not a Terraform one.** Cloudflare refuses to upload any
+      # script to an account that has never been given a workers.dev subdomain — `wrangler deploy`
+      # fails with `code: 10063` telling you to open the dashboard, which is the one thing this
+      # pipeline exists to avoid. The dashboard creates it as a side effect of being visited; the
+      # API creates it directly, and there is no Terraform resource for it in provider v5 (only
+      # `cloudflare_workers_script_subdomain`, which is per-script and needs the script to exist).
+      #
+      # Every Worker sets `workers_dev: false`, so nothing is ever served there — and for the two
+      # internal ones that is load-bearing rather than tidy (ADR-0049). This exists purely to satisfy
+      # the upload check.
+      #
+      # Idempotent by reading first: the name is account-global and cannot be changed once set, so
+      # a blind PUT on an already-configured account would be an error rather than a no-op.
+      - name: The account has a workers.dev subdomain
+        working-directory: .
+        run: |
+          set -euo pipefail
+          base="https://api.cloudflare.com/client/v4/accounts/${{ secrets.CLOUDFLARE_ACCOUNT_ID }}/workers/subdomain"
+          auth="Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}"
+
+          existing=$(curl -sS -H "$auth" "$base" |
+            python3 -c "import json,sys; print((json.load(sys.stdin).get('result') or {}).get('subdomain') or '')")
+
+          if [ -n "$existing" ]; then
+            echo "workers.dev subdomain already set: ${existing}.workers.dev"
+            exit 0
+          fi
+
+          # Derived from the zone so staging and production cannot collide with each other. The
+          # namespace is global across all of Cloudflare, so this can still be taken by a stranger.
+          want=$(echo "${{ inputs.zone || 'nport.online' }}" | tr '.' '-')
+          echo "no subdomain on this account — claiming ${want}.workers.dev"
+
+          response=$(curl -sS -X PUT -H "$auth" -H "Content-Type: application/json" \
+            --data "{\"subdomain\":\"${want}\"}" "$base")
+
+          python3 - "$response" <<'PY'
+          import json, sys
+          body = json.loads(sys.argv[1])
+          if body.get("success"):
+              print("claimed:", body["result"]["subdomain"] + ".workers.dev")
+              sys.exit(0)
+          print("could not claim the subdomain:", json.dumps(body.get("errors"), indent=2))
+          print(
+              "\nThe workers.dev namespace is global, so this name may belong to another account."
+              "\nPick another by hand once (dashboard -> Workers & Pages -> Subdomain); any name"
+              "\nworks, since workers_dev is false on every Worker here and nothing is served there."
+          )
+          sys.exit(1)
+          PY
+
+      # Terraform's own message names the environment variable, not where it comes from. This names
+      # the setting to go and fix.
+      - name: The organization is configured
+        run: |
+          if [ -z "${TF_CLOUD_ORGANIZATION}" ]; then
+            echo "TF_CLOUD_ORGANIZATION is empty — the caller passed no tf_organization."
+            exit 1
+          fi
+          echo "organization: ${TF_CLOUD_ORGANIZATION}, workspace: ${TF_WORKSPACE}"
+
+      - run: terraform fmt -check -diff
+      - run: terraform init -input=false
+      - run: terraform validate
+
+      # `node_id` is **read from `apps/node/wrangler.jsonc`**, not passed in, because the node Worker
+      # already reads it at runtime to register itself and Terraform needs the same value to publish the
+      # `_nport-node` TXT record that proves the zone. A second home for it is a second thing to keep in
+      # step, and a mismatch is silent: the proof names one node, the registration another, the registry
+      # refuses `proof-missing`, and `src/register.ts` swallows it by design.
+      - name: Plan
+        working-directory: .
+        run: |
+          set -euo pipefail
+          node_id="$(node scripts/wrangler-var.mjs --app node --env ${{ inputs.environment || 'staging' }} --var NODE_ID)"
+          echo "node id: ${node_id}"
+          cd infra/terraform
+          terraform plan -input=false -out=tfplan \
+            -var "account_id=${{ secrets.CLOUDFLARE_ACCOUNT_ID }}" \
+            -var "zone_name=${{ inputs.zone || 'nport.online' }}" \
+            -var "node_id=${node_id}"
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+
+      # Applies the plan file, not a fresh evaluation — so what lands is exactly what was planned,
+      # even if something changed underneath in between.
+      - name: Apply
+        run: terraform apply -input=false -auto-approve tfplan
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+
+      # Every Worker's generated runtime secrets, **keyed by Worker name** (ADR-0040, ADR-0049), handed
+      # to the deploy jobs as an artifact rather than a job output: **job outputs are not encrypted and
+      # appear in the run's API payload.** An artifact is scoped to the run, and each consuming job
+      # deletes its own copy.
+      #
+      # Keyed per Worker because `nport-node` and `nport-registry` both require a secret called
+      # `POW_SECRET` whose values must *differ* — `infra/terraform/secrets.tf` says why, and
+      # `pnpm deploy:check` fails if they ever come from one resource.
+      #
+      # `::add-mask::` first, so that if any later step echoes one of these it is redacted in the log
+      # rather than printed. Masking is not a substitute for not printing them; it is the backstop.
+      - name: Capture the Worker secrets
+        run: |
+          terraform output -raw worker_secrets > worker-secrets.json
+          python3 -c "
+          import json
+          for secrets in json.load(open('worker-secrets.json')).values():
+              for value in secrets.values():
+                  print(f'::add-mask::{value}')
+          "
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: worker-secrets-${{ inputs.environment || 'staging' }}
+          path: infra/terraform/worker-secrets.json
+          retention-days: 1
+
+  # ── The backend, in dependency order ───────────────────────────────────────────────────
+  #
+  # **Three Workers, and the order is not arbitrary** (ADR-0049). The gateway declares `services`
+  # bindings to `nport-node` and `nport-registry`; Cloudflare rejects a deploy whose binding names a
+  # script that does not exist, so both must be up first. Node and registry are independent of each
+  # other and run in parallel.
+  #
+  # Each takes only the secrets its own `src/env.ts` requires, filtered out of Terraform's per-Worker
+  # map. `pnpm deploy:check` fails the gate if any Worker requires a secret the deploy does not carry,
+  # or carries one it does not require.
+  node:
+    name: Deploy node
+    needs: terraform
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment || 'staging' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.NPORT_REPO }}
+          ref: ${{ env.NPORT_SHA }}
+          token: ${{ secrets.PAT_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 1
+      - run: corepack enable
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      - name: wrangler deploy
+        run: pnpm --filter @nport/node exec wrangler deploy --env ${{ inputs.environment || 'staging' }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: worker-secrets-${{ inputs.environment || 'staging' }}
+          path: /tmp/secrets
+
+      # **After the deploy, not before.** `wrangler secret bulk` targets a Worker that already
+      # exists. The window between the two is one where the Worker is live without its secrets, and
+      # it fails closed there rather than misbehaving: `missingBindings` in `src/env.ts` refuses the
+      # request instead of provisioning with a missing key.
+      #
+      # One call for all of them, so a partial application is not a state the Worker can be left in.
+      #
+      # Four come from Terraform; `CF_API_TOKEN` is merged in here. It is the only one carrying
+      # Cloudflare authority, and it is made by hand precisely so that nothing Terraform runs can
+      # mint one (ADR-0043) — which is what lets the CI token stay free of `User -> API Tokens`.
+      # **Only this Worker gets it**: the gateway terminates every public request and must not be
+      # able to provision anything.
+      # `env:` rather than the expression inline, so the value is never a substring of a command
+      # line that could reach a log or a process list.
+      - name: Sync the node's secrets
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          WORKER_CF_API_TOKEN: ${{ secrets.WORKER_CF_API_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${WORKER_CF_API_TOKEN}" ]; then
+            echo "WORKER_CF_API_TOKEN is not set on the ${{ inputs.environment || 'staging' }} environment."
+            echo "It is the node's own Cloudflare credential — docs/DEPLOYMENT.md section 3."
+            exit 1
+          fi
+
+          python3 - <<'PY'
+          import json, os
+          path = "/tmp/secrets/worker-secrets.json"
+          secrets = json.load(open(path))["nport-node"]
+          secrets["CF_API_TOKEN"] = os.environ["WORKER_CF_API_TOKEN"]
+          json.dump(secrets, open(path, "w"))
+          print("secrets to sync:", ", ".join(sorted(secrets)))
+          PY
+
+          pnpm --filter @nport/node exec wrangler secret bulk /tmp/secrets/worker-secrets.json \
+            --env ${{ inputs.environment || 'staging' }}
+          rm -f /tmp/secrets/worker-secrets.json
+
+  registry:
+    name: Deploy registry
+    needs: terraform
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment || 'staging' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.NPORT_REPO }}
+          ref: ${{ env.NPORT_SHA }}
+          token: ${{ secrets.PAT_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 1
+      - run: corepack enable
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      - name: wrangler deploy
+        run: pnpm --filter @nport/registry exec wrangler deploy --env ${{ inputs.environment || 'staging' }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: worker-secrets-${{ inputs.environment || 'staging' }}
+          path: /tmp/secrets
+
+      # One secret, and it is **not** the node's `POW_SECRET`. Two independent values are what stop a
+      # challenge issued by a node being redeemable here (`infra/terraform/secrets.tf`).
+      - name: Sync the registry's secrets
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          path = "/tmp/secrets/worker-secrets.json"
+          secrets = json.load(open(path))["nport-registry"]
+          json.dump(secrets, open(path, "w"))
+          print("secrets to sync:", ", ".join(sorted(secrets)))
+          PY
+
+          pnpm --filter @nport/registry exec wrangler secret bulk /tmp/secrets/worker-secrets.json \
+            --env ${{ inputs.environment || 'staging' }}
+          rm -f /tmp/secrets/worker-secrets.json
+
+  # **Last, and it is the only one with a hostname.** Until this deploys, the deployment answers
+  # nothing at all — which is the right failure order: a gateway pointing at Workers that exist beats
+  # a hostname pointing at bindings that do not.
+  gateway:
+    name: Deploy gateway
+    needs: [node, registry]
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment || 'staging' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.NPORT_REPO }}
+          ref: ${{ env.NPORT_SHA }}
+          token: ${{ secrets.PAT_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 1
+      - run: corepack enable
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      - name: wrangler deploy
+        run: pnpm --filter @nport/gateway exec wrangler deploy --env ${{ inputs.environment || 'staging' }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: worker-secrets-${{ inputs.environment || 'staging' }}
+          path: /tmp/secrets
+
+      # `IP_HASH_SECRET` and nothing else. This Worker holds **no Cloudflare credential** — it is the
+      # largest attack surface in a deployment and the one component that must not be able to
+      # provision (ADR-0049).
+      - name: Sync the gateway's secrets
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          path = "/tmp/secrets/worker-secrets.json"
+          secrets = json.load(open(path))["nport-gateway"]
+          json.dump(secrets, open(path, "w"))
+          print("secrets to sync:", ", ".join(sorted(secrets)))
+          PY
+
+          pnpm --filter @nport/gateway exec wrangler secret bulk /tmp/secrets/worker-secrets.json \
+            --env ${{ inputs.environment || 'staging' }}
+          rm -f /tmp/secrets/worker-secrets.json
+
+  # ── The site ───────────────────────────────────────────────────────────────────────────
+  web:
+    name: Deploy site
+    needs: terraform
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment || 'staging' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.NPORT_REPO }}
+          ref: ${{ env.NPORT_SHA }}
+          token: ${{ secrets.PAT_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 1
+      - run: corepack enable
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      # OpenNext builds and deploys with its own command; `wrangler deploy` on `.open-next/worker.js`
+      # would ship a Worker with no assets and still return 200 (`apps/web/CLAUDE.md` § Gotchas).
+      - name: Build and deploy
+        run: |
+          pnpm --filter @nport/web exec opennextjs-cloudflare build --env ${{ inputs.environment || 'staging' }}
+          pnpm --filter @nport/web exec opennextjs-cloudflare deploy --env ${{ inputs.environment || 'staging' }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+  # ── Proof ──────────────────────────────────────────────────────────────────────────────
+  verify:
+    name: Verify
+    needs: [gateway, web]
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment || 'staging' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.NPORT_REPO }}
+          ref: ${{ env.NPORT_SHA }}
+          token: ${{ secrets.PAT_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+
+      # Compares the live `/v1/meta` against the committed `wrangler.jsonc` for this environment,
+      # rather than against numbers written here. A 200 proves a Worker is running; this proves the
+      # *configured* Worker is running, which is the failure `notInheritable` actually produces.
+      #
+      # It is also the only step that proves the three Workers are **wired together**: `/v1/meta`
+      # crosses a service binding, and a gateway bound to a script that does not resolve answers
+      # `/v1/health` cheerfully and `INTERNAL` there.
+      - name: The deployed backend matches the repository
+        run: node scripts/verify-deployment.mjs --host "$API_HOST" --env "${{ inputs.environment || 'staging' }}"
+        env:
+          # **A named allowance for one open defect, and it expires by failing.**
+          #
+          # Node #1 registers on a minority of its cron ticks (`docs/ROADMAP.md` defect 41), so the
+          # staleness check fails on every push. The fault is measured and written down and the next
+          # step needs a `wrangler tail` no CI job can run — so a permanently red Verify would add no
+          # information while skipping the `smoke` job behind it, and teach everyone to scroll past the
+          # five other checks in here.
+          #
+          # Delete this block when defect 41 closes. It is not self-removing, and the reason is in the
+          # script: the fault is intermittent, so a check that also failed when the node *looked* healthy
+          # would go red on whichever side of a cron tick it happened to land — randomly, in both
+          # directions. A tripwire needs a stable state to trip on.
+          NPORT_KNOWN_STALE_NODE: "41"
+
+      # **Not just `/`.** The home page is served by the one route least likely to be missing, so a
+      # single curl there stays green through the exact failure this site has already had: every one
+      # of the 33 `/errors/<slug>` pages 404ing *from the Worker* while `next build` prerendered all
+      # of them (ADR-0048). `web-e2e` catches that against a local preview; nothing was checking the
+      # artifact that actually deployed, which is the layer users are on.
+      #
+      # The script reads the slugs from `schema/errors.json` rather than listing them, and includes
+      # one slug that must 404 — without a negative, a Worker serving one fallback document for
+      # every path passes the whole list. It needs no `pnpm install`, only the checkout above.
+      - name: The site serves what it built
+        run: node scripts/verify-site.mjs --host "$SITE_HOST"
+
+  # ── A tunnel that carries real traffic ─────────────────────────────────────────────────
+  #
+  # `verify` proves the deployed Worker matches the repository. It does not prove that anything can
+  # actually tunnel through it, and every other test stops at a fake: `pnpm test` drives `apps/node`
+  # in real `workerd` against `test/fake-cloudflare.ts`, and `pnpm smoke` drives the CLI against
+  # `wrangler dev` with a credential the edge refuses on purpose. This is the only job anywhere in
+  # the pipeline that opens a port on the internet.
+  #
+  # **A job here rather than its own workflow, and that is the second time this moved.** It was
+  # `.github/workflows/smoke.yml`, called with `uses: ./…` — a same-repo reference, which is why the
+  # file could not simply follow the rest of CI into `Nport-Link/ppap` when ADR-0057 split them. It
+  # is inlined instead: the capability is unchanged, and this repository's Actions sidebar loses an
+  # entry it only ever had to satisfy a `workflow_call`.
+  #
+  # **The 3-OS matrix is in ppap and stays there.** Gate G2's cross-platform criterion needs macOS
+  # and Windows, panda is Linux, and those two legs were 93% of a nightly's billed cost — the macOS
+  # one alone at the 10× multiplier. `.github/workflows/ppap/smoke.yml` owns the nightly; this owns
+  # the per-deploy proof, on Linux, where it costs nothing.
+  #
+  # **Staging only.** Production deploys must not mint real tunnels on the production account as a
+  # side effect of shipping; there the ppap nightly is the right cadence, and the per-source hourly
+  # cap is deliberately tighter (`apps/node/wrangler.jsonc`).
+  smoke:
+    name: Smoke
+    needs: verify
+    if: (inputs.environment || 'staging') == 'staging'
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment || 'staging' }}
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.NPORT_REPO }}
+          ref: ${{ env.NPORT_SHA }}
+          token: ${{ secrets.PAT_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+
+      - uses: ./.github/actions/install-capnp
+
+      # rust-toolchain.toml pins the exact version and rustup honours it, so nothing here names a
+      # version — same as `smoke.yml` beside this file. A second place naming one is a second place
+      # to forget to bump.
+      - run: rustup show active-toolchain || rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: deploy-smoke
+
+      # Release, not debug. The debug binary is ~39 MB and slower to start, and the thing being
+      # proved is the artifact users get.
+      - name: Build the CLI
+        run: cargo build --release -p nport
+
+      - name: A real tunnel carries real traffic
+        shell: bash
+        env:
+          BACKEND: https://api.${{ inputs.zone || 'nport.online' }}
+        run: |
+          # `--expiry` is the nightly's job (`smoke.yml` beside this file). It abandons a tunnel with
+          # SIGKILL and waits for the server's own alarm to delete the DNS record — two and a half
+          # minutes and one extra create, for a property that does not change between commits. A
+          # per-deploy run should not pay it.
+          node scripts/smoke-live.mjs \
+            --backend "$BACKEND" \
+            --binary target/release/nport

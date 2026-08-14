@@ -16,9 +16,10 @@ name: Smoke
 # 93% of a nightly smoke's cost was the two platforms that cannot run on a Linux self-hosted box.
 # On a public repository they are free. `docs/CI.md`, ADR-0057.
 #
-# **The private repository keeps its own `smoke.yml`** for the `workflow_call` path — `deploy.yml`
-# invokes it with `uses: ./.github/workflows/smoke.yml`, a same-repo reference that cannot point
-# here. That copy is Linux-only on panda; this one owns the nightly and the full matrix.
+# **The per-deploy run is a job inside `deploy.yml`**, not a workflow of its own. It was a separate
+# private `smoke.yml` invoked with `uses: ./…`, and that same-repo reference is exactly why it could
+# not follow the rest of CI here; inlining it removed the last workflow this repository listed purely
+# to satisfy a `workflow_call`. That job is Linux-only on panda; this one owns the nightly matrix.
 #
 # It costs one create per OS per run against the environment's per-source hourly cap. Runners have
 # distinct addresses so they do not compete with each other, but a human debugging from one machine

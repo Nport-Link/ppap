@@ -6,7 +6,7 @@ name: Codegen drift
 #
 # **Runs in `Nport-Link/ppap`** — see the header of `ci.yml` in this directory, and `docs/CI.md`.
 # It shares the `nport-ci` dispatch type with `ci.yml`, so one `repository_dispatch` from
-# `trigger-ppap.yml` starts both. Two workflows rather than one job in `ci.yml` because they answer
+# `ppap.yml` starts both. Two workflows rather than one job in `ci.yml` because they answer
 # different questions and their concurrency groups are independent — a codegen re-run should not
 # cancel an in-flight e2e.
 #
