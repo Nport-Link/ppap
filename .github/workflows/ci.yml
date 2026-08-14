@@ -395,6 +395,14 @@ jobs:
 
   # ── A tunnel, on three operating systems ──────────────────────────────────────────
   #
+  # **There are two tunnel tests and they answer different questions.** `deploy.yml`'s `Prove a
+  # tunnel` runs straight after a staging deploy, on Linux, and asks *can the thing just deployed
+  # carry traffic* — it is the last link in gate → terraform → deploy → verify. This one is nightly
+  # and asks *does the edge still work for installed clients*, on the two platforms no self-hosted
+  # runner covers. The Linux leg overlaps by one create a night, and it is kept so that one run
+  # answers for all three platforms rather than sending somebody to a second workflow for a third of
+  # the answer.
+  #
   # **The only test in here that opens a port on the internet.** Every other job stops at a fake:
   # `pnpm test` drives `apps/node` in real `workerd` against `test/fake-cloudflare.ts`, and
   # `pnpm smoke` drives the CLI against `wrangler dev` with a credential the edge refuses on purpose.
@@ -412,8 +420,11 @@ jobs:
   # creates per push — roughly a hundred pushes a day — which would exhaust that cap and start
   # failing for a reason unrelated to any commit. The per-deploy proof is a separate Linux-only job
   # in `deploy.yml`; this is the cross-platform one.
-  smoke:
-    name: Smoke (${{ matrix.os }})
+  # **No `name:` override, deliberately.** With one, a *skipped* job displays the literal
+  # `Smoke (${{ matrix.os }})` in the checks list, because a matrix that never expanded has nothing to
+  # interpolate — and this job is skipped on every push, which is most of them. Falling back to the
+  # job id gives `nightly-tunnel (ubuntu-latest)` when it runs and `nightly-tunnel` when it does not.
+  nightly-tunnel:
     if: github.event_name == 'schedule'
     runs-on: ${{ matrix.os }}
     # One OS failing must not cancel the others. Which platforms fail is the diagnosis — "Windows
@@ -479,7 +490,7 @@ jobs:
   # which reads as "still running" rather than "failed" and is worse than no status at all.
   report:
     name: Report
-    needs: [seed, typescript, web-e2e, desktop-e2e, rust, deny, drift, smoke]
+    needs: [seed, typescript, web-e2e, desktop-e2e, rust, deny, drift, nightly-tunnel]
     if: always() && github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
