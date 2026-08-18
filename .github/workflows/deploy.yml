@@ -442,9 +442,49 @@ jobs:
   # **Last, and it is the only one with a hostname.** Until this deploys, the deployment answers
   # nothing at all — which is the right failure order: a gateway pointing at Workers that exist beats
   # a hostname pointing at bindings that do not.
+  # **The relay data plane, and it must land before the gateway** (defect 196). `apps/gateway` binds
+  # `TunnelSocket` with `"script_name": "nport-edge"`, and Cloudflare refuses a Durable Object binding
+  # into a script that does not exist:
+  #
+  #     Cannot create binding for class in script 'nport-edge' that does not exist. [code: 10061]
+  #
+  # So this job is not an addition to the pipeline, it is a **precondition of it**. REL-2 added the
+  # Worker and REL-4 added the gateway's binding to it; neither added a deploy, so every deploy since
+  # has failed at the gateway and taken `Verify` and `Prove a tunnel` down as skipped with it. The
+  # three that ran before it succeeded, which is what made the run look half-finished rather than
+  # broken.
+  #
+  # No secret sync, unlike node/registry/gateway: `apps/edge/wrangler.jsonc` carries only `vars`, and
+  # a `wrangler secret bulk` against an empty set is a step that can only fail.
+  edge:
+    name: Deploy edge
+    needs: terraform
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment || 'staging' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.NPORT_REPO }}
+          ref: ${{ env.NPORT_SHA }}
+          token: ${{ secrets.PAT_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 1
+      - run: corepack enable
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      - name: wrangler deploy
+        run: pnpm --filter @nport/edge exec wrangler deploy --env ${{ inputs.environment || 'staging' }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
   gateway:
     name: Deploy gateway
-    needs: [node, registry]
+    needs: [node, registry, edge]
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment || 'staging' }}
     steps:
