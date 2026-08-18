@@ -73,14 +73,14 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
-          for ctx in typescript web-e2e desktop-e2e rust deny drift summary; do
+          for ctx in typescript web-e2e desktop-e2e desktop-window rust deny drift summary; do
             gh api --method POST "/repos/${NPORT_REPO}/statuses/${NPORT_SHA}" \
               -f state=pending \
               -f context="ppap / ${ctx}" \
               -f target_url="${RUN_URL}" \
               -f description="queued in Nport-Link/ppap" >/dev/null
           done
-          echo "Seeded 7 pending statuses on ${NPORT_SHA}."
+          echo "Seeded 8 pending statuses on ${NPORT_SHA}."
 
   typescript:
     name: TypeScript
@@ -241,6 +241,90 @@ jobs:
       - run: pnpm --filter @nport/desktop check:inspector
       - run: pnpm --filter @nport/desktop check:tokens
 
+  # **The real window, on all three engines** (ADR-0072) — the tier `desktop-e2e` above is explicitly
+  # not. That one drives the WebView *content* in Chromium with the IPC stubbed; this launches the
+  # built binary and drives WKWebView, WebView2 and WebKitGTK, which is where `backdrop-filter` and
+  # font rendering actually diverge and where `apps/desktop/CLAUDE.md` says platform bugs come from.
+  #
+  # **ADR-0072 said this could not run here, and that was wrong twice over.** It said the tier "needs a
+  # GUI, so it does not run on the CI runners as configured" — true of a bare Linux runner and false of
+  # every runner once `xvfb-run` is in front of it, which is Tauri's own documented recipe. macOS and
+  # Windows runners have a window server already. The `rust` job below has installed the WebKitGTK
+  # headers on Linux since it existed, so the only new dependency here is `xvfb`.
+  #
+  # **`tauri build`, not `cargo build`.** Only the CLI runs `beforeBuildCommand` and embeds
+  # `frontendDist`; a `cargo`-built binary opens a window whose WebView answers `asset not found:
+  # index.html`, which is indistinguishable from an app that crashed on mount. That cost a retracted
+  # defect entry — `docs/ROADMAP.md` 206 — and is why `build:e2e` is a script rather than a command
+  # written out here.
+  #
+  # **Smoke only.** `wdio.conf.ts` defaults to `e2e/smoke.e2e.ts`; `e2e/staging.e2e.ts` needs a
+  # deployed control plane and reads `~/.nport/config.toml`, so it is `test:e2e:staging` and not a
+  # per-commit gate.
+  desktop-window:
+    name: Desktop window (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.NPORT_REPO }}
+          ref: ${{ env.NPORT_SHA }}
+          token: ${{ secrets.PAT_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 1
+      - uses: ./.github/actions/install-capnp
+      # The same set the `rust` job installs to compile `src-tauri`, plus `xvfb` — which only this job
+      # needs, because only this job opens a window.
+      - name: Install the Linux WebView, GTK headers and a virtual display
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            libssl-dev \
+            xvfb
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: corepack enable
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      # Split from the run below so a build failure and a *test* failure are different lines in the
+      # log. They have completely different causes and the release build is the slow half.
+      - name: Build the app with the WebDriver feature
+        run: pnpm --filter @nport/desktop run build:e2e
+
+      # `xvfb-run -a` picks a free display number rather than assuming :99 is untaken.
+      - name: Drive the window
+        if: runner.os == 'Linux'
+        run: xvfb-run -a pnpm --filter @nport/desktop exec wdio run wdio.conf.ts
+      - name: Drive the window
+        if: runner.os != 'Linux'
+        run: pnpm --filter @nport/desktop exec wdio run wdio.conf.ts
+
+      # The window is the thing under test and it leaves no artefact, so on a failure the log is all
+      # there is. WebdriverIO writes its own under `logs/`.
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: desktop-window-${{ matrix.os }}
+          path: |
+            apps/desktop/logs/
+            logs/
+          retention-days: 7
+          if-no-files-found: ignore
+
   rust:
     name: Rust (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -390,7 +474,7 @@ jobs:
   # which reads as "still running" rather than "failed" and is worse than no status at all.
   report:
     name: Report
-    needs: [seed, typescript, web-e2e, desktop-e2e, rust, deny, drift]
+    needs: [seed, typescript, web-e2e, desktop-e2e, desktop-window, rust, deny, drift]
     if: always()
     runs-on: ubuntu-latest
     steps:
