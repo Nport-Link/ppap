@@ -404,7 +404,30 @@ jobs:
         run: |
           set -euo pipefail
 
+          # **Retried, because one transient 5xx here marks a green run red.** Every check can pass
+          # and this job still fails: it is the only step that talks to the statuses API, and on
+          # 2026-08-17 that API returned `503 No server is currently available` for several minutes
+          # while reads kept working. The commit went red with nothing wrong in it, and a re-run hit
+          # the same window.
+          #
+          # Four attempts with a widening gap covers an outage of about a minute, which is the shape
+          # these take. A status that genuinely cannot be posted still fails the job — `set -e` and the
+          # final attempt are unguarded — because a reporting step that swallows its own failure is
+          # worse than one that is occasionally flaky: it reports nothing and says everything is fine.
           post() {
+            local attempt
+            for attempt in 1 2 3; do
+              if gh api --method POST "/repos/${NPORT_REPO}/statuses/${NPORT_SHA}" \
+                -f state="$2" -f context="ppap / $1" \
+                -f target_url="${RUN_URL}" -f description="$3" >/dev/null 2>&1; then
+                return 0
+              fi
+              echo "posting '$1' failed (attempt ${attempt}/4), retrying in $((attempt * 5))s" >&2
+              sleep $((attempt * 5))
+            done
+
+            # The last one is not swallowed: its error text is what tells whoever reads this run
+            # whether the API was down or the token lost its scope.
             gh api --method POST "/repos/${NPORT_REPO}/statuses/${NPORT_SHA}" \
               -f state="$2" -f context="ppap / $1" \
               -f target_url="${RUN_URL}" -f description="$3" >/dev/null
