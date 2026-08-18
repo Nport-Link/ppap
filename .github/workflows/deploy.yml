@@ -482,6 +482,22 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 
+      # **After the deploy, and it is the half `wrangler deploy` does not do** (defect 197). Wrangler
+      # attaches the routes a config declares and never detaches the ones it dropped, so `"routes": []`
+      # leaves every previously attached route live — which is how deploying this Worker for the first
+      # time took `api.nport.online` down with a `*.nport.online/*` wildcard, and why reverting the
+      # config could not put it back. Someone had to open the dashboard.
+      #
+      # Only this Worker's own pattern routes, proven by the `script` field the API returns. Custom
+      # domains — the apex, `www.`, `api.` — are a different API and are never touched.
+      - name: Reconcile the edge's routes
+        run: >-
+          node scripts/reconcile-routes.mjs
+          --config apps/edge/wrangler.jsonc
+          --env ${{ inputs.environment || 'staging' }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+
   gateway:
     name: Deploy gateway
     needs: [node, registry, edge]
