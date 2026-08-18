@@ -73,7 +73,7 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
-          for ctx in typescript web-e2e desktop-e2e desktop-window rust deny drift summary; do
+          for ctx in typescript web-e2e desktop-e2e desktop-app rust-cli deny drift summary; do
             gh api --method POST "/repos/${NPORT_REPO}/statuses/${NPORT_SHA}" \
               -f state=pending \
               -f context="ppap / ${ctx}" \
@@ -261,8 +261,11 @@ jobs:
   # **Smoke only.** `wdio.conf.ts` defaults to `e2e/smoke.e2e.ts`; `e2e/staging.e2e.ts` needs a
   # deployed control plane and reads `~/.nport/config.toml`, so it is `test:e2e:staging` and not a
   # per-commit gate.
-  desktop-window:
-    name: Desktop window (${{ matrix.os }})
+  # **Named "Desktop app", not "Desktop window".** The display name renders beside the matrix leg, so
+  # the old one read `Desktop window (windows-latest)` — two different senses of "window" a character
+  # apart, on the one job where a developer is already asking themselves which platform failed.
+  desktop-app:
+    name: Desktop app (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -318,15 +321,20 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: failure()
         with:
-          name: desktop-window-${{ matrix.os }}
+          name: desktop-app-${{ matrix.os }}
           path: |
             apps/desktop/logs/
             logs/
           retention-days: 7
           if-no-files-found: ignore
 
-  rust:
-    name: Rust (${{ matrix.os }})
+  # **"Rust CLI" is the name; the scope is the whole workspace.** `cargo clippy --all-targets` and
+  # `cargo test` here cover `crates/*` **and** `apps/desktop/src-tauri`, which is a workspace member —
+  # so a failure in this job is not necessarily in `crates/cli`. The name says CLI because that is the
+  # artefact these three legs exist to keep portable, and because `Rust (windows-latest)` beside
+  # `Desktop app (windows-latest)` reads as though only one of them is about a platform.
+  rust-cli:
+    name: Rust CLI (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -474,7 +482,7 @@ jobs:
   # which reads as "still running" rather than "failed" and is worse than no status at all.
   report:
     name: Report
-    needs: [seed, typescript, web-e2e, desktop-e2e, desktop-window, rust, deny, drift]
+    needs: [seed, typescript, web-e2e, desktop-e2e, desktop-app, rust-cli, deny, drift]
     if: always()
     runs-on: ubuntu-latest
     steps:
