@@ -298,15 +298,19 @@ jobs:
       - name: Install the Linux WebView, GTK headers and a virtual display
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            libgtk-3-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            libxdo-dev \
-            libssl-dev \
-            xvfb
+          # **Install first, refresh only if that fails.** `apt-get update` is the half that broke in
+          # run 32224853056 — it hung on `file:/etc/apt/apt-mirrors.txt Mirrorlist` and the job died
+          # without ever reaching the install. The runner image ships package lists and every one of
+          # these installs straight from them, so a mirror outage should not decide whether this
+          # repository can build. Same ordering, same reason, as `.github/actions/install-capnp`.
+          packages="libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev
+                    librsvg2-dev libxdo-dev libssl-dev xvfb"
+          # shellcheck disable=SC2086 # deliberate word splitting: $packages is a list, not one name
+          sudo apt-get install -y $packages || {
+            echo "the cached lists could not satisfy these — refreshing the index and retrying"
+            sudo apt-get update
+            sudo apt-get install -y $packages
+          }
       - run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - run: corepack enable
@@ -409,14 +413,16 @@ jobs:
       - name: Install the Linux WebView and GTK development headers
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            libgtk-3-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            libxdo-dev \
-            libssl-dev
+          # Install first, refresh only on failure — see the same step in `desktop-app` and
+          # `.github/actions/install-capnp`. `apt-get update` is what hung in run 32224853056.
+          packages="libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev
+                    librsvg2-dev libxdo-dev libssl-dev"
+          # shellcheck disable=SC2086 # deliberate word splitting: $packages is a list, not one name
+          sudo apt-get install -y $packages || {
+            echo "the cached lists could not satisfy these — refreshing the index and retrying"
+            sudo apt-get update
+            sudo apt-get install -y $packages
+          }
       # rust-toolchain.toml pins the exact version, and rustup honours it.
       - run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
