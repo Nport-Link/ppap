@@ -329,6 +329,37 @@ jobs:
         if: runner.os != 'Linux'
         run: pnpm --filter @nport/desktop exec wdio run wdio.conf.ts
 
+      # **A camera, not a gate** — UI-1. `screens` renders the app in Chromium; what that cannot show
+      # is how `backdrop-filter` composites and how text renders in WKWebView, WebView2 and WebKitGTK,
+      # which is the comparison UI-1 still owes and the reason it is open. These shots come out of the
+      # WebView through the driver, so they need no screen-recording permission on macOS and no
+      # display beyond the `xvfb` this job already has.
+      #
+      # `continue-on-error` because a broken camera is not a broken app, and this job's gate is the
+      # smoke above. It stays visible as a red step inside a green job rather than turning the matrix
+      # red for a screenshot.
+      - name: Photograph every screen in the engine that ships
+        continue-on-error: true
+        if: runner.os == 'Linux'
+        run: xvfb-run -a pnpm --filter @nport/desktop exec wdio run wdio.conf.ts --spec e2e/shots.e2e.ts
+      - name: Photograph every screen in the engine that ships
+        continue-on-error: true
+        if: runner.os != 'Linux'
+        run: pnpm --filter @nport/desktop exec wdio run wdio.conf.ts --spec e2e/shots.e2e.ts
+
+      # **Uploaded on success, which is the point.** Every other artefact here exists to explain a
+      # failure; these exist so that somebody who owns neither a Windows machine nor a Linux desktop
+      # can open thirteen pictures per platform and compare them against
+      # `docs/mockup/NPort Desktop.dc.html`. That comparison is what is left of UI-1.
+      - name: Keep the pictures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-screens-${{ matrix.os }}
+          path: apps/desktop/screens/real/
+          retention-days: 14
+          if-no-files-found: warn
+
       # The window is the thing under test and it leaves no artefact, so on a failure the log is all
       # there is. WebdriverIO writes its own under `logs/`.
       - uses: actions/upload-artifact@v4
