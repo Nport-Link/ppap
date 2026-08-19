@@ -159,11 +159,25 @@ jobs:
           node-version-file: .nvmrc
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      # Only chromium, and `--with-deps` for the system libraries a headless browser needs on a bare
-      # runner. Playwright pins its own browser build, which is what makes a baseline stable enough to
-      # be worth having (ADR-0023) — so this must not be replaced by a system Chrome.
+      # Only chromium. Playwright pins its own browser build, which is what makes a baseline stable
+      # enough to be worth having (ADR-0023) — so this must not be replaced by a system Chrome.
+      #
+      # **The download and the system libraries are two steps, because they fail differently.**
+      # `--with-deps` shells out to `apt-get` underneath, so it inherits the mirrorlist hang that
+      # took out the Linux jobs in run 32224853056 — and it did: `Web e2e` spent its entire
+      # 30-minute budget inside this one step and was killed, twice, while the identical command in
+      # `desktop-e2e` succeeded. A browser download that works has no business being held hostage by
+      # an apt mirror.
       - name: Install the pinned browser
-        run: pnpm --filter @nport/web exec playwright install --with-deps chromium
+        run: pnpm --filter @nport/web exec playwright install chromium
+      # Bounded and non-fatal: the runner image already carries most of what headless chromium needs,
+      # so if this cannot reach a mirror the right outcome is to try the tests anyway. A genuinely
+      # missing library then fails `pnpm test:e2e` in seconds with a browser-launch error, which is a
+      # better failure than thirty minutes of silence.
+      - name: Install its system libraries
+        timeout-minutes: 5
+        continue-on-error: true
+        run: pnpm --filter @nport/web exec playwright install-deps chromium
       # `playwright.config.ts` builds through OpenNext and serves the real Worker, so there is no
       # separate build step here. That is deliberate: this tier exists to test the artifact that
       # deploys, and the first thing it caught was 33 pages that 404 only from the Worker.
@@ -248,8 +262,14 @@ jobs:
           node-version-file: .nvmrc
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      # Split for the same reason as `web-e2e` above — `--with-deps` runs `apt-get`, and an apt
+      # mirror should not decide whether a browser that downloaded fine can be used.
       - name: Install the pinned browser
-        run: pnpm --filter @nport/desktop exec playwright install --with-deps chromium
+        run: pnpm --filter @nport/desktop exec playwright install chromium
+      - name: Install its system libraries
+        timeout-minutes: 5
+        continue-on-error: true
+        run: pnpm --filter @nport/desktop exec playwright install-deps chromium
       - run: pnpm --filter @nport/desktop check:inspector
       - run: pnpm --filter @nport/desktop check:tokens
 
