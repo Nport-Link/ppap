@@ -706,6 +706,11 @@ jobs:
         shell: bash
         env:
           BACKEND: https://api.${{ inputs.zone || 'nport.online' }}
+          # For the ingress lookup this script does when a tunnel never routes (defect 205). It reads
+          # the rule *before* the lease is torn down, which is the only moment it exists — see
+          # `reportIngress`. Absent locally, where the lookup is skipped rather than failed.
+          CLOUDFLARE_API_TOKEN: ${{ secrets.WORKER_CF_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           # `--expiry` is the nightly's job (`smoke.yml` beside this file). It abandons a tunnel with
           # SIGKILL and waits for the server's own alarm to delete the DNS record — two and a half
@@ -715,35 +720,3 @@ jobs:
             --backend "$BACKEND" \
             --binary target/release/nport
 
-      # **On failure only, and this is what turns defect 205 from a hypothesis into a finding.**
-      #
-      # A tunnel that never serves is indistinguishable from one that does, client-side: the connector
-      # reports four QUIC connections up either way. The difference lives in the ingress rule
-      # Cloudflare holds for that tunnel, which nothing outside the account can read — which is why six
-      # hypotheses about this defect were wrong and why the seventh should not be guessed.
-      #
-      # This job already runs in an environment holding the account credentials, so the evidence costs
-      # one read-only call per recent tunnel and arrives attached to the run that failed rather than
-      # being reconstructed afterwards from a hostname that has since expired.
-      #
-      # `continue-on-error` because a diagnostic must never change a verdict: the smoke's failure above
-      # is the result, and this is a note underneath it.
-      - name: What ingress rule did those tunnels get?
-        if: failure()
-        continue-on-error: true
-        # **`WORKER_CF_API_TOKEN`, and the choice is deliberate.** The first run of this step answered
-        # `1001: Not authorized` against `/cfd_tunnel/<id>/configurations`: the deploy token can write
-        # DNS and Workers and cannot read a tunnel's configuration, because the only credential in this
-        # pipeline carrying Cloudflare *tunnel* authority is the node's own (ADR-0043). Reading back
-        # what the node wrote therefore needs the token the node wrote it with.
-        #
-        # The comment on `Sync the node's secrets` says "only this Worker gets it", and that rule is
-        # about the **gateway** — which terminates public requests and must never be able to provision.
-        # This is a read-only step in the same workflow the token already appears in, so it widens
-        # nothing at the repository level. **Worth a second look from the owner all the same**, since it
-        # is the first use of that token outside handing it to the node.
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.WORKER_CF_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          ZONE: ${{ inputs.zone || 'nport.online' }}
-        run: node scripts/inspect-tunnel-config.mjs --zone "$ZONE" --limit 5
