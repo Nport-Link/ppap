@@ -705,3 +705,25 @@ jobs:
           node scripts/smoke-live.mjs \
             --backend "$BACKEND" \
             --binary target/release/nport
+
+      # **On failure only, and this is what turns defect 205 from a hypothesis into a finding.**
+      #
+      # A tunnel that never serves is indistinguishable from one that does, client-side: the connector
+      # reports four QUIC connections up either way. The difference lives in the ingress rule
+      # Cloudflare holds for that tunnel, which nothing outside the account can read — which is why six
+      # hypotheses about this defect were wrong and why the seventh should not be guessed.
+      #
+      # This job already runs in an environment holding the account credentials, so the evidence costs
+      # one read-only call per recent tunnel and arrives attached to the run that failed rather than
+      # being reconstructed afterwards from a hostname that has since expired.
+      #
+      # `continue-on-error` because a diagnostic must never change a verdict: the smoke's failure above
+      # is the result, and this is a note underneath it.
+      - name: What ingress rule did those tunnels get?
+        if: failure()
+        continue-on-error: true
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          ZONE: ${{ inputs.zone || 'nport.online' }}
+        run: node scripts/inspect-tunnel-config.mjs --zone "$ZONE" --limit 5
