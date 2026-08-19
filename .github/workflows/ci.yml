@@ -63,9 +63,18 @@ jobs:
   # `seed` runs first and with no `needs:`, so a run that is cancelled, or never starts because the
   # dispatch raced a force-push, leaves a visible pending rather than leaving the commit blank.
   # A commit with no status at all is indistinguishable from one nobody asked about.
+# **Every job carries one, because nothing did and the default is six hours.** On 2026-08-19
+# `install-capnp` hung and took `Codegen drift` with it for 45 minutes; it never failed, it stopped,
+# and concurrency eventually killed it. The action is bounded now, but a bound inside one step only
+# covers the hang somebody has already seen. These are the floor under the ones nobody has.
+#
+# Each is roughly twice the slowest observed run of that job — a backstop against a hang, not a
+# performance target. A limit that trips on a slow-but-working job is worse than no limit, because
+# the next person learns to re-run rather than to read.
   seed:
     name: Seed statuses
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Mark every context pending
         env:
@@ -85,6 +94,7 @@ jobs:
   typescript:
     name: TypeScript
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
         with:
@@ -134,6 +144,7 @@ jobs:
     # When `ubuntu-latest` rolls to the next LTS, an unpinned job re-rasterises every baseline and
     # the diff looks like a site regression. Bump this deliberately, and re-record in the same change.
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
         with:
@@ -222,6 +233,7 @@ jobs:
   desktop-e2e:
     name: Desktop e2e
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
         with:
@@ -267,6 +279,7 @@ jobs:
   desktop-app:
     name: Desktop app (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -336,6 +349,7 @@ jobs:
   rust-cli:
     name: Rust CLI (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -392,6 +406,7 @@ jobs:
   deny:
     name: cargo-deny
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
         with:
@@ -424,6 +439,7 @@ jobs:
   drift:
     name: Codegen drift
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
         with:
@@ -485,6 +501,7 @@ jobs:
     needs: [seed, typescript, web-e2e, desktop-e2e, desktop-app, rust-cli, deny, drift]
     if: always()
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Post the result of every job onto the private commit
         env:

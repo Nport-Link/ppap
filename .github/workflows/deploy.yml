@@ -119,6 +119,7 @@ jobs:
   gate:
     name: Gate
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
         with:
@@ -156,6 +157,7 @@ jobs:
     name: Terraform
     needs: gate
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     environment: ${{ inputs.environment || 'staging' }}
     defaults:
       run:
@@ -320,6 +322,7 @@ jobs:
     name: Deploy node
     needs: terraform
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     environment: ${{ inputs.environment || 'staging' }}
     steps:
       - uses: actions/checkout@v7
@@ -392,6 +395,7 @@ jobs:
     name: Deploy registry
     needs: terraform
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     environment: ${{ inputs.environment || 'staging' }}
     steps:
       - uses: actions/checkout@v7
@@ -460,6 +464,7 @@ jobs:
     name: Deploy edge
     needs: terraform
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     environment: ${{ inputs.environment || 'staging' }}
     steps:
       - uses: actions/checkout@v7
@@ -502,6 +507,7 @@ jobs:
     name: Deploy gateway
     needs: [node, registry, edge]
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     environment: ${{ inputs.environment || 'staging' }}
     steps:
       - uses: actions/checkout@v7
@@ -555,6 +561,7 @@ jobs:
     name: Deploy site
     needs: terraform
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     environment: ${{ inputs.environment || 'staging' }}
     steps:
       - uses: actions/checkout@v7
@@ -586,6 +593,7 @@ jobs:
     name: Verify
     needs: [gateway, web]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     environment: ${{ inputs.environment || 'staging' }}
     steps:
       - uses: actions/checkout@v7
@@ -662,6 +670,7 @@ jobs:
     needs: verify
     if: (inputs.environment || 'staging') == 'staging'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     environment: ${{ inputs.environment || 'staging' }}
     env:
       CARGO_TERM_COLOR: always
